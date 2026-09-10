@@ -181,7 +181,8 @@ button.ghost:hover { border-color: var(--orange); color: var(--warm-text); }
 .error-box[hidden] { display: none; }
 
 /* ---- identification strip ---- */
-.id-strip { display: flex; flex-wrap: wrap; align-items: center; gap: 10px 22px; }
+.id-strip { display: flex; flex-direction: column; gap: 10px; }
+.id-top { display: flex; flex-wrap: wrap; align-items: center; gap: 10px 22px; }
 .id-strip .device { font-size: 1.05rem; font-weight: 600; }
 .id-strip .device span { color: var(--ink-3); font-weight: 400; font-size: 0.8125rem; }
 .pill { display: inline-flex; align-items: center; gap: 6px; padding: 4px 12px; border-radius: 999px; font-size: 0.75rem; font-weight: 600; }
@@ -190,7 +191,7 @@ button.ghost:hover { border-color: var(--orange); color: var(--warm-text); }
 .pill.mode-p2p { background: #EAF0FB; color: #2C4C8F; }
 :root:not([data-theme="light"]) .pill.mode-p2p { background: #1E2A44; color: #9CBBEE; }
 .pill.mode-unknown { background: var(--warn-bg); color: var(--warn); }
-.id-kv { margin-left: auto; display: flex; flex-wrap: wrap; gap: 4px 22px; font-size: 0.8125rem; color: var(--ink-2); }
+.id-kv { display: flex; flex-wrap: wrap; gap: 4px 22px; font-size: 0.8125rem; color: var(--ink-2); }
 .id-kv b { color: var(--ink); font-weight: 600; }
 .warn-line { margin-top: 10px; padding: 8px 12px; border-radius: var(--r-sm); background: var(--warn-bg); color: var(--warm-text); font-size: 0.8125rem; font-weight: 600; }
 .warn-line[hidden] { display: none; }
@@ -301,8 +302,10 @@ details.inspector + details.inspector { margin-top: 14px; }
 
   <section class="panel" id="section-id" hidden>
     <div class="id-strip">
-      <div class="device" id="id-device">—</div>
-      <span class="pill" id="id-mode-pill">—</span>
+      <div class="id-top">
+        <div class="device" id="id-device">—</div>
+        <span class="pill" id="id-mode-pill">—</span>
+      </div>
       <div class="id-kv" id="id-kv"></div>
     </div>
     <div class="warn-line" id="id-warn" hidden></div>
@@ -334,11 +337,11 @@ details.inspector + details.inspector { margin-top: 14px; }
     </div>
   </section>
 
-  <section class="panel" id="panel-distribution" hidden>
-    <h2>Distribuição do tempo</h2>
-    <p class="sub" id="dist-sub">—</p>
-    <div class="dist-bar" id="dist-bar"></div>
-    <div class="legend-row" id="dist-legend"></div>
+  <section class="panel" id="panel-consumption-distribution" hidden>
+    <h2>Distribuição do consumo</h2>
+    <p class="sub" id="consumption-dist-sub">—</p>
+    <div class="dist-bar" id="consumption-dist-bar"></div>
+    <div class="legend-row" id="consumption-dist-legend"></div>
   </section>
 
   <div class="two-col">
@@ -360,6 +363,13 @@ details.inspector + details.inspector { margin-top: 14px; }
       </div>
     </section>
   </div>
+
+  <section class="panel" id="panel-distribution" hidden>
+    <h2>Distribuição do tempo</h2>
+    <p class="sub" id="dist-sub">—</p>
+    <div class="dist-bar" id="dist-bar"></div>
+    <div class="legend-row" id="dist-legend"></div>
+  </section>
 
   <section class="panel" id="panel-files" hidden>
     <h2>Identificação &amp; firmware</h2>
@@ -644,7 +654,7 @@ details.inspector + details.inspector { margin-top: 14px; }
     var pctClass = statClass(a.pctRemaining);
     var sB = $("stat-battery");
     sB.className = "stat " + pctClass;
-    sB.querySelector(".value").textContent = fmtDec(a.pctRemaining, 0) + "%";
+    sB.querySelector(".value").textContent = fmtDec(a.pctRemaining, 2) + "%";
     sB.querySelector(".note").textContent = fmtDec(a.remainingMah, 0) + " / " + fmtDec(a.usableMah, 0) + " mAh úteis restantes";
     $("stat-battery-firmware").innerHTML = a.firmwarePct !== null
       ? "Informada pelo equipamento <b>" + fmtDec(a.firmwarePct, 0) + "%</b>"
@@ -680,6 +690,29 @@ details.inspector + details.inspector { margin-top: 14px; }
     $("panel-distribution").hidden = false;
   }
 
+  function renderConsumptionDistribution(a) {
+    var unusedMah = Math.max(0, BATTERY_CAPACITY_MAH - a.consumedMah);
+    var segs = [
+      { label: "LoRa TX", mah: a.txMas / 3600, color: "var(--seg-tx)" },
+      { label: "LoRa RX", mah: a.rxMas / 3600, color: "var(--seg-rx)" },
+      { label: "Repouso / outros", mah: a.otherMas / 3600, color: "var(--seg-sleep)" },
+      { label: "Não consumido", mah: unusedMah, color: "var(--line-strong)" }
+    ];
+    $("consumption-dist-sub").textContent = "Base: capacidade nominal da bateria — " +
+      fmtDec(BATTERY_CAPACITY_MAH, 0) + " mAh (" + fmtDec(a.consumedMah, 1) + " mAh consumidos até agora)";
+    $("consumption-dist-bar").innerHTML = segs.map(function (s) {
+      var pct = clamp((s.mah / BATTERY_CAPACITY_MAH) * 100, 0, 100);
+      return '<span style="flex-basis:' + pct + '%; background:' + s.color + '"></span>';
+    }).join("");
+    $("consumption-dist-legend").innerHTML = segs.map(function (s) {
+      var pct = (s.mah / BATTERY_CAPACITY_MAH) * 100;
+      return '<span class="legend-item"><i class="dot" style="background:' + s.color + '"></i>' +
+        '<span class="lbl">' + s.label + '</span><span class="val">' + fmtDec(s.mah, 1) + ' mAh</span>' +
+        '<span class="pct">(' + fmtDec(pct, 1) + '%)</span></span>';
+    }).join("");
+    $("panel-consumption-distribution").hidden = false;
+  }
+
   function checkRow(label, cls, mah, max, opts) {
     opts = opts || {};
     var pct = clamp((mah / max) * 100, 0, 100);
@@ -689,7 +722,7 @@ details.inspector + details.inspector { margin-top: 14px; }
     return '<div class="check-row">' +
       "<" + labelTag + ' class="' + labelCls + '"' + labelAttrs + ">" + label + "</" + labelTag + ">" +
       '<div class="check-track ' + cls + '"><i style="width:' + pct + '%"></i></div>' +
-      '<div class="check-value' + (opts.sub ? " sub" : "") + '">' + fmtDec(mah, 1) + ' mAh' +
+      '<div class="check-value' + (opts.sub ? " sub" : "") + '">' + fmtDec(mah, 2) + ' mAh' +
       (opts.extra ? ' <span style="font-weight:400">(' + opts.extra + ')</span>' : "") + '</div>' +
       '</div>';
   }
@@ -820,7 +853,7 @@ details.inspector + details.inspector { margin-top: 14px; }
   }
 
   function hideResultPanels() {
-    ["section-id", "section-results", "panel-distribution", "panel-crosscheck",
+    ["section-id", "section-results", "panel-distribution", "panel-consumption-distribution", "panel-crosscheck",
       "panel-packets", "panel-files", "panel-raw"].forEach(function (id) { $(id).hidden = true; });
   }
 
@@ -899,13 +932,15 @@ details.inspector + details.inspector { margin-top: 14px; }
     renderIdentification(pkt, a, envelope);
     if (pkt.diagnostic) {
       renderStats(a, delta);
-      renderDistribution(a);
+      renderConsumptionDistribution(a);
       renderCrossCheck(a);
       renderPackets(a);
+      renderDistribution(a);
       renderRaw(a);
     } else {
       $("section-results").hidden = true;
       $("panel-distribution").hidden = true;
+      $("panel-consumption-distribution").hidden = true;
       $("panel-crosscheck").hidden = true;
       $("panel-packets").hidden = true;
       $("panel-raw").hidden = true;
