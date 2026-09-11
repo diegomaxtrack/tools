@@ -49,6 +49,7 @@
   --seg-tx: #F4691A;
   --seg-rx: #2C4C8F;
   --seg-sleep: #9AA2B8;
+  --seg-ble: #17877E;
 
   --shadow: 0 1px 2px rgba(40, 53, 85, .06), 0 10px 28px -18px rgba(40, 53, 85, .28);
 
@@ -84,6 +85,7 @@
     --seg-tx: #FA8534;
     --seg-rx: #7FA3E0;
     --seg-sleep: #78849F;
+    --seg-ble: #5CC2B6;
 
     --shadow: 0 1px 2px rgba(0, 0, 0, .45), 0 10px 28px -18px rgba(0, 0, 0, .8);
   }
@@ -115,6 +117,7 @@
   --seg-tx: #FA8534;
   --seg-rx: #7FA3E0;
   --seg-sleep: #78849F;
+  --seg-ble: #5CC2B6;
 
   --shadow: 0 1px 2px rgba(0, 0, 0, .45), 0 10px 28px -18px rgba(0, 0, 0, .8);
 }
@@ -245,6 +248,17 @@ button.ghost:hover { border-color: var(--orange); color: var(--warm-text); }
 .check-value.sub { font-size: 0.75rem; color: var(--ink-3); }
 .check-verdict { margin-top: 12px; font-size: 0.8125rem; color: var(--ink-2); }
 
+/* ---- bluetooth estimate ---- */
+.ble-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 14px; }
+@media (max-width: 860px) { .ble-grid { grid-template-columns: 1fr; } }
+.ble-cell { background: var(--surface-2); border: 1px solid var(--line); border-radius: var(--r-sm); padding: 14px 16px; display: flex; flex-direction: column; gap: 4px; }
+.ble-cell .label { font-size: 0.75rem; font-weight: 600; text-transform: uppercase; letter-spacing: .05em; color: var(--ink-3); }
+.ble-cell .value { font-size: 1.375rem; font-weight: 600; letter-spacing: -0.01em; }
+.ble-cell .value small { font-size: 0.875rem; font-weight: 600; color: var(--ink-3); margin-left: 2px; }
+.ble-cell .note { font-size: 0.75rem; color: var(--ink-2); }
+.ble-note { margin: 14px 0 0; font-size: 0.8125rem; color: var(--ink-2); }
+.ble-note + .ble-note { margin-top: 6px; }
+
 /* ---- tables ---- */
 table.plain { width: 100%; border-collapse: collapse; font-size: 0.8125rem; }
 table.plain th { text-align: left; font-size: 0.6875rem; text-transform: uppercase; letter-spacing: .05em; color: var(--ink-3); font-weight: 600; padding: 0 10px 8px; border-bottom: 1px solid var(--line); }
@@ -364,6 +378,14 @@ details.inspector + details.inspector { margin-top: 14px; }
     </section>
   </div>
 
+  <section class="panel" id="panel-ble" hidden>
+    <h2>Bluetooth — tempo e consumo estimados</h2>
+    <p class="sub">O pacote de status não transporta os contadores de BLE do firmware (<code>ble_adv_ms</code> e <code>ble_con_ms</code> existem em <code>BATT_CONSUME_T</code>, mas <code>appLoraStatusFields()</code> não os copia). Os valores abaixo saem por resíduo: <code>used_ma_s</code> é a soma fechada dos cinco baldes de tempo, e o que ele excede o custo de LoRa TX, LoRa RX e repouso só pode ter ido para o rádio BLE.</p>
+    <div class="ble-grid" id="ble-grid"></div>
+    <p class="ble-note" id="ble-note"></p>
+    <p class="ble-note" id="ble-note-precision"></p>
+  </section>
+
   <section class="panel" id="panel-distribution" hidden>
     <h2>Distribuição do tempo</h2>
     <p class="sub" id="dist-sub">—</p>
@@ -412,9 +434,23 @@ details.inspector + details.inspector { margin-top: 14px; }
   var $ = function (id) { return document.getElementById(id); };
 
   // Power model from mxt/app/app_battery.c (batt_get_consume_info)
-  var POWER = { loraTxMa: 130, loraRxMa: 10, sleepMa: 0.005 };
+  var POWER = { loraTxMa: 130, loraRxMa: 10, sleepMa: 0.005, bleAdvMa: 0.01, bleConnMa: 0.19 };
   var BATTERY_CAPACITY_MAH = 1850;   // BATT_SIZE_MAH in app_battery.h
   var USABLE_FRACTION = 0.85;        // usable fraction used by batt_get_remaining_percentage
+
+  // Worst-case error of the BLE residual below, in mA*s. The status packet
+  // sends the radio/sleep windows divided down to 100 ms units and used_ma_s
+  // truncated to an integer, so the residual inherits their rounding: up to
+  // 99 ms of TX at 130 mA (12.9), 99 ms of RX at 10 mA (1.0) and the
+  // truncation of used_ma_s itself (1.0). The bias is one-sided - the divided
+  // fields understate the LoRa cost, so the residual overstates BLE.
+  var BLE_RESIDUAL_TOLERANCE_MAS = 14.9;
+
+  // lora_help_tx_cnt packs the battery percentage in its low byte and the
+  // cumulative BLE connection time in the high one — BATT_BLE_CONN_STEP_S
+  // seconds per step, 255 saturating. See LORA_STATUS_HELP_PACK in
+  // app_loraprotocol.h.
+  var BLE_CONN_STEP_S = 16;
 
   var FIELD_DOCS = {
     lora: {
@@ -427,7 +463,7 @@ details.inspector + details.inspector { margin-top: 14px; }
       rssiLevel: { label: "RSSI (rede)", unit: "dBm", desc: "Nível de sinal medido pelo lado da rede/gateway.", tag: "schema" },
       rssiLevelDevice: { label: "RSSI (dispositivo)", unit: "dBm", desc: "Nível de sinal medido pelo próprio dispositivo.", tag: "schema" },
       lastTransmission: { label: "Última transmissão", unit: "s", desc: "Tempo decorrido desde a última transmissão.", tag: "schema" },
-      txHelpPackets: { label: "Bateria restante (firmware)", unit: "%", desc: "Este campo se chama “TX Help” por herança de código, mas desde o commit que reaproveitou o slot (antes da versão 2.1.7) ele carrega batt_get_remaining_percentage() — a % de bateria calculada pelo próprio firmware, não uma contagem de pacotes.", tag: "confirmed", fw: "batt_get_remaining_percentage() em appLoraStatusFields (reaproveita o campo lora_help_tx_cnt)" },
+      txHelpPackets: { label: "Bateria restante (firmware)", unit: "%", desc: "Este campo se chama “TX Help” por herança de código, mas desde o commit que reaproveitou o slot (antes da versão 2.1.7) ele carrega batt_get_remaining_percentage() — a % de bateria calculada pelo próprio firmware, não uma contagem de pacotes. A partir da versão 2.2.0 o uint16 passa a ser empacotado: byte baixo = percentual de bateria, byte alto = tempo de conexão BLE acumulado em passos de 16 s (0xFF satura). A ferramenta decide a leitura pela versão de firmware reportada em files[].", tag: "confirmed", fw: "LORA_STATUS_HELP_PACK(batt_get_remaining_percentage(), batt_get_ble_conn_time_encoded()) em appLoraStatusFields" },
       offlineCounter: { label: "Quedas offline", unit: "ocorrências", desc: "Quantidade de vezes que o dispositivo ficou offline.", tag: "schema" },
       offlineTotalTime: { label: "Tempo offline", unit: "s", desc: "Tempo total acumulado sem conectividade.", tag: "schema" }
     },
@@ -445,7 +481,7 @@ details.inspector + details.inspector { margin-top: 14px; }
       intervalSleep: { label: "Tempo em repouso", unit: "ms", desc: "Tempo total em modo IDLE/sleep (sem tarefa LoRa).", tag: "confirmed", fw: "sleep_ms" },
       intervalRunning: { label: "Tempo ativo", unit: "ms", desc: "Tempo total com a CPU ativa (fora do repouso).", tag: "schema" },
       intervalUsbConnected: { label: "USB conectado", unit: "ms", desc: "Tempo total com USB conectado.", tag: "schema" },
-      intervalBTConnected: { label: "BLE conectado", unit: "ms", desc: "Tempo total com uma conexão BLE ativa.", tag: "schema" },
+      intervalBTConnected: { label: "BLE conectado", unit: "ms", desc: "Tempo total com uma conexão BLE ativa. O A40BV3 mantém esse contador internamente (ble_con_ms), mas appLoraStatusFields() não o copia para o pacote — quando presente, chega zerado. Veja o painel “Bluetooth” para a estimativa por resíduo.", tag: "schema" },
       maxTemperature: { label: "Temperatura máxima", unit: "raw", desc: "Temperatura máxima registrada (codificação não confirmada).", tag: "schema" },
       meanTemperature: { label: "Temperatura média", unit: "raw", desc: "Temperatura média registrada (codificação não confirmada).", tag: "schema" },
       lifeInterval: { label: "Vida útil", unit: "s", desc: "Tempo total desde o início de vida do equipamento.", tag: "confirmed", fw: "life_s" },
@@ -483,6 +519,30 @@ details.inspector + details.inspector { margin-top: 14px; }
       return big.toString(16).toUpperCase().padStart(bytes * 2, "0");
     } catch (e) { return null; }
   }
+
+  // The device reports its own firmware version among the files it lists —
+  // mtc_maxpb_protocol.c fills files[0] with FT_FIRMWARE_APP and the
+  // RELEASE_*_VERSION macros. That is what decides how lora_help_tx_cnt is
+  // read, so the two never have to be guessed apart from each other.
+  function firmwareVersionOf(pkt) {
+    var files = Array.isArray(pkt && pkt.files) ? pkt.files : [];
+    for (var i = 0; i < files.length; i++) {
+      var f = files[i];
+      if (!f || !/FIRMWARE_APP|A40[AB]_FW/.test(String(f.fileType))) continue;
+      if (!has(f.major) && !has(f.minor) && !has(f.patch)) continue;
+      return { major: num(f.major), minor: num(f.minor), patch: num(f.patch) };
+    }
+    return null;
+  }
+
+  function versionAtLeast(v, major, minor, patch) {
+    if (!v) return false;
+    if (v.major !== major) return v.major > major;
+    if (v.minor !== minor) return v.minor > minor;
+    return v.patch >= patch;
+  }
+
+  function versionText(v) { return v ? v.major + "." + v.minor + "." + v.patch : null; }
 
   function fieldDoc(section, key) {
     var doc = FIELD_DOCS[section] && FIELD_DOCS[section][key];
@@ -529,14 +589,43 @@ details.inspector + details.inspector { margin-top: 14px; }
     var otherMas = Math.max(0, consumptionMas - txMas - rxMas);
     var impliedOtherCurrentMa = otherTimeS > 0 ? otherMas / otherTimeS : null;
 
-    // Outside TX/RX, app_battery.c's own model assumes deep sleep at 5 µA for
-    // that whole stretch of time. Whatever the reported consumption exceeds
-    // that theoretical floor by is attributed to Bluetooth (BLE Eddystone
-    // beacon + connections) as a worst-case estimate — see batt_add_ble_*
-    // in app_battery.c, which the wire status packet never reports on its own.
-    var sleepBaselineMas = otherTimeS * POWER.sleepMa;
+    // batt_get_consume_info() builds used_ma_s as a closed sum over five time
+    // buckets — sleep at 5 µA, BLE advertising at 10 µA, a live BLE link at
+    // 190 µA, LoRa TX at 130 mA and LoRa RX at 10 mA. Three of those buckets
+    // travel in the status packet, so whatever the reported consumption
+    // exceeds their cost by is the energy that went into the BLE radio. The
+    // ble_adv_ms / ble_con_ms counters themselves never reach the wire.
+    // When intervalSleep is absent (LoRaWAN packets), sleep is inferred as the
+    // whole non-radio stretch, which also sweeps the unbucketed CPU-active
+    // time into the BLE figure — an upper bound rather than an estimate.
+    var sleepS = sleepMsField !== null ? sleepMsField / 1000 : otherTimeS;
+    var bleFromReportedSleep = sleepMsField !== null;
+    var sleepBaselineMas = sleepS * POWER.sleepMa;
     var bleMas = Math.max(0, otherMas - sleepBaselineMas);
     var bleCurrentMa = otherTimeS > 0 ? bleMas / otherTimeS : null;
+
+    // Energy alone cannot tell advertising apart from a live link, so the two
+    // interpretations bracket each unknown: all of the BLE energy spent
+    // connected is the most connected time it could represent, and all of it
+    // spent advertising the most advertising time.
+    var bleConnMaxS = bleMas / POWER.bleConnMa;
+    var bleAdvMaxS = bleMas / POWER.bleAdvMa;
+    var bleToleranceS = BLE_RESIDUAL_TOLERANCE_MAS / POWER.bleConnMa;
+
+    // Second equation, available only when the packet reports sleep: every
+    // second of the device's life that is not sleep, TX or RX is a second the
+    // BLE radio was advertising or connected (plus CPU-active slices that fall
+    // in no bucket). With that window the two unknowns can be separated —
+    // which is solvable exactly when the window sits inside the bracket above.
+    var bleWindowS = bleFromReportedSleep
+      ? Math.max(0, lifeS - sleepS - txMs / 1000 - rxMs / 1000)
+      : null;
+    var bleSplit = null;
+    if (bleWindowS !== null && bleWindowS > 0 && bleMas > 0 &&
+      bleWindowS >= bleConnMaxS && bleWindowS <= bleAdvMaxS) {
+      var connS = clamp((bleMas - POWER.bleAdvMa * bleWindowS) / (POWER.bleConnMa - POWER.bleAdvMa), 0, bleWindowS);
+      bleSplit = { connS: connS, advS: bleWindowS - connS };
+    }
 
     var consumedMah = consumptionMas / 3600;
     var usableMah = USABLE_FRACTION * BATTERY_CAPACITY_MAH;
@@ -546,10 +635,34 @@ details.inspector + details.inspector { margin-top: 14px; }
     var remainingMah = Math.max(0, usableMah - consumedMah);
     var daysRemainingLife = avgCurrentLifeMa ? remainingMah / avgCurrentLifeMa / 24 : null;
 
-    // The wire status packet (tLoraPacket_Status) repurposes its legacy
-    // "help tx counter" slot to carry batt_get_remaining_percentage() directly
-    // from the firmware — see appLoraStatusFields() in app_loraprotocol.c.
-    var firmwarePct = has(lora.txHelpPackets) ? num(lora.txHelpPackets) : null;
+    // From 2.2.0 the status packet packs two values into its legacy "help tx
+    // counter" slot — see LORA_STATUS_HELP_PACK in app_loraprotocol.h: the
+    // firmware's own battery percentage in the low byte and the cumulative BLE
+    // connection time in the high one. Before 2.2.0 the whole uint16 is the
+    // percentage, so the reported firmware version picks the reading.
+    var fwVersion = firmwareVersionOf(pkt);
+    var helpIsPacked = versionAtLeast(fwVersion, 2, 2, 0);
+    var helpRaw = has(lora.txHelpPackets) ? num(lora.txHelpPackets) : null;
+    var firmwarePct = null, bleConnReportedS = null, bleConnSaturated = false;
+    if (helpRaw !== null) {
+      if (helpIsPacked) {
+        var helpHigh = (helpRaw >> 8) & 0xFF;
+        firmwarePct = helpRaw & 0xFF;
+        bleConnReportedS = helpHigh * BLE_CONN_STEP_S;
+        bleConnSaturated = helpHigh === 0xFF;
+      } else {
+        firmwarePct = helpRaw;
+      }
+    }
+
+    // A reported link time replaces the residual split: the connection is then
+    // measured, its cost follows from the firmware's own 190 µA, and
+    // advertising is whatever the BLE window has left over.
+    var bleConnMeasured = bleConnReportedS !== null && bleConnReportedS > 0;
+    var bleConnMeasuredMas = bleConnMeasured ? bleConnReportedS * POWER.bleConnMa : null;
+    var bleAdvMeasuredS = (bleConnMeasured && bleWindowS !== null)
+      ? Math.max(0, bleWindowS - bleConnReportedS)
+      : null;
 
     return {
       raw: pkt, diag: diag, lora: lora, battery: battery, core: core,
@@ -559,6 +672,12 @@ details.inspector + details.inspector { margin-top: 14px; }
       txMas: txMas, rxMas: rxMas, otherTimeS: otherTimeS, otherMas: otherMas,
       impliedOtherCurrentMa: impliedOtherCurrentMa,
       sleepBaselineMas: sleepBaselineMas, bleMas: bleMas, bleCurrentMa: bleCurrentMa,
+      bleFromReportedSleep: bleFromReportedSleep, bleConnMaxS: bleConnMaxS, bleAdvMaxS: bleAdvMaxS,
+      bleToleranceS: bleToleranceS, bleWindowS: bleWindowS, bleSplit: bleSplit,
+      fwVersion: fwVersion, helpIsPacked: helpIsPacked,
+      bleConnReportedS: bleConnReportedS, bleConnSaturated: bleConnSaturated,
+      bleConnMeasured: bleConnMeasured, bleConnMeasuredMas: bleConnMeasuredMas,
+      bleAdvMeasuredS: bleAdvMeasuredS,
       consumedMah: consumedMah, usableMah: usableMah, pctRemaining: pctRemaining,
       avgCurrentLifeMa: avgCurrentLifeMa, remainingMah: remainingMah, daysRemainingLife: daysRemainingLife,
       firmwarePct: firmwarePct
@@ -614,6 +733,9 @@ details.inspector + details.inspector { margin-top: 14px; }
       kv.push(["Uptime desde reset", humanizeSeconds(a.uptimeS)]);
     }
     kv.push(["Vida útil", humanizeSeconds(a.lifeS)]);
+    if (a.fwVersion) {
+      kv.push(["Firmware", versionText(a.fwVersion) + (a.helpIsPacked ? "" : " (anterior a 2.2.0)")]);
+    }
     $("id-kv").innerHTML = kv.map(function (p) { return "<span>" + p[0] + " <b>" + p[1] + "</b></span>"; }).join("");
 
     var warnEl = $("id-warn");
@@ -656,9 +778,14 @@ details.inspector + details.inspector { margin-top: 14px; }
     sB.className = "stat " + pctClass;
     sB.querySelector(".value").textContent = fmtDec(a.pctRemaining, 2) + "%";
     sB.querySelector(".note").textContent = fmtDec(a.remainingMah, 0) + " / " + fmtDec(a.usableMah, 0) + " mAh úteis restantes";
-    $("stat-battery-firmware").innerHTML = a.firmwarePct !== null
-      ? "Informada pelo equipamento <b>" + fmtDec(a.firmwarePct, 0) + "%</b>"
-      : "Equipamento não informou bateria neste pacote";
+    // A value outside 0–100 is not a percentage: almost always a packed
+    // lora_help_tx_cnt read the legacy way because the packet carries no
+    // firmware version to decode it with.
+    $("stat-battery-firmware").innerHTML = a.firmwarePct === null
+      ? "Equipamento não informou bateria neste pacote"
+      : a.firmwarePct > 100
+        ? "lora_help_tx_cnt = <b>" + fmtInt(a.firmwarePct) + "</b>, fora da faixa de 0–100% — provavelmente empacotado, sem versão de firmware no pacote para decodificar"
+        : "Informada pelo equipamento <b>" + fmtDec(a.firmwarePct, 0) + "%</b>";
 
     var days = delta ? delta.daysRemaining : a.daysRemainingLife;
     var sD = $("stat-days");
@@ -672,10 +799,17 @@ details.inspector + details.inspector { margin-top: 14px; }
   function renderDistribution(a) {
     var total = a.totalTimeS * 1000 || 1;
     var segs = [
-      { key: "tx", label: "LoRa TX", ms: a.txMs, color: "var(--seg-tx)" },
-      { key: "rx", label: "LoRa RX", ms: a.rxMs, color: "var(--seg-rx)" },
-      { key: "sleep", label: "Repouso / outras tarefas", ms: a.otherTimeS * 1000, color: "var(--seg-sleep)" }
+      { label: "LoRa TX", ms: a.txMs, color: "var(--seg-tx)" },
+      { label: "LoRa RX", ms: a.rxMs, color: "var(--seg-rx)" }
     ];
+    // With intervalSleep reported, the non-radio stretch splits into measured
+    // sleep and the window the BLE radio (plus unbucketed CPU work) lived in.
+    if (a.bleFromReportedSleep) {
+      segs.push({ label: "Repouso (reportado)", ms: a.sleepMsField, color: "var(--seg-sleep)" });
+      segs.push({ label: "Bluetooth / CPU ativa", ms: a.bleWindowS * 1000, color: "var(--seg-ble)" });
+    } else {
+      segs.push({ label: "Repouso / outras tarefas", ms: a.otherTimeS * 1000, color: "var(--seg-sleep)" });
+    }
     $("dist-sub").textContent = "Base de tempo: vida útil do equipamento (lifeInterval) — " + humanizeSeconds(a.totalTimeS);
     $("dist-bar").innerHTML = segs.map(function (s) {
       var pct = clamp((s.ms / total) * 100, 0, 100);
@@ -739,7 +873,8 @@ details.inspector + details.inspector { margin-top: 14px; }
 
     if (hasBreakdown) {
       html += '<div class="check-sub-rows" id="check-sub-rows" hidden>' +
-        checkRow("Repouso profundo", "baseline sub", a.sleepBaselineMas / 3600, max, { sub: true }) +
+        checkRow(a.bleFromReportedSleep ? "Repouso profundo (reportado)" : "Repouso profundo (inferido)",
+          "baseline sub", a.sleepBaselineMas / 3600, max, { sub: true }) +
         checkRow("Bluetooth (estimado)", "baseline sub", a.bleMas / 3600, max, {
           sub: true, extra: a.bleCurrentMa !== null ? fmtDec(a.bleCurrentMa * 1000, 0) + " µA" : null
         }) +
@@ -758,6 +893,124 @@ details.inspector + details.inspector { margin-top: 14px; }
       verdict.hidden = true;
     }
     $("panel-crosscheck").hidden = false;
+  }
+
+  function bleCell(label, value, note) {
+    return '<div class="ble-cell"><div class="label">' + label + '</div>' +
+      '<div class="value">' + value + '</div>' +
+      '<div class="note">' + note + '</div></div>';
+  }
+
+  function renderBle(a) {
+    if (!a.consumptionSource) { $("panel-ble").hidden = true; return; }
+
+    var shownMas = a.bleConnMeasured ? a.bleConnMeasuredMas : a.bleMas;
+    var pctOfTotal = a.consumptionMas > 0 ? (shownMas / a.consumptionMas) * 100 : null;
+    var cells = bleCell(
+      a.bleConnMeasured ? "Consumo da conexão BLE" : "Consumo Bluetooth",
+      fmtDec(shownMas / 3600, 2) + "<small>mAh</small>",
+      fmtInt(shownMas) + " mA·s" + (pctOfTotal !== null ? " — " + fmtDec(pctOfTotal, 1) + "% do consumo total" : "") +
+        (a.bleConnMeasured ? " · tempo medido × 190 µA" : "")
+    );
+
+    if (a.bleConnMeasured) {
+      cells += bleCell(
+        "Tempo conectado — medido",
+        humanizeSeconds(a.bleConnReportedS) + (a.bleConnSaturated ? "<small>ou mais</small>" : ""),
+        a.bleConnSaturated
+          ? "campo saturado em 0xFF — o equipamento acumulou pelo menos esse tempo de link"
+          : "reportado pelo equipamento em lora_help_tx_cnt, passos de " + BLE_CONN_STEP_S + " s"
+      );
+      cells += bleCell(
+        "Tempo em advertising",
+        a.bleAdvMeasuredS !== null ? humanizeSeconds(a.bleAdvMeasuredS) : "—",
+        a.bleAdvMeasuredS !== null
+          ? "o que sobra da janela de " + humanizeSeconds(a.bleWindowS) + " fora de repouso e rádio LoRa"
+          : "requer o tempo de repouso (intervalSleep) para ser separado"
+      );
+    } else if (a.bleSplit) {
+      cells += bleCell(
+        "Tempo conectado",
+        humanizeSeconds(a.bleSplit.connS),
+        "separado pela janela de " + humanizeSeconds(a.bleWindowS) + " fora de repouso e rádio LoRa, a 190 µA"
+      );
+      cells += bleCell(
+        "Tempo em advertising",
+        humanizeSeconds(a.bleSplit.advS),
+        "o restante da mesma janela, a 10 µA"
+      );
+    } else {
+      cells += bleCell(
+        "Tempo conectado — máximo",
+        humanizeSeconds(a.bleConnMaxS),
+        "se todo o consumo BLE tiver vindo de sessão conectada, a 190 µA"
+      );
+      cells += bleCell(
+        "Tempo em advertising — máximo",
+        humanizeSeconds(a.bleAdvMaxS),
+        "se tiver vindo todo de advertising, a 10 µA"
+      );
+    }
+    $("ble-grid").innerHTML = cells;
+
+    var note;
+    if (a.bleConnMeasured) {
+      // With a measured link time the residual stops being the estimate and
+      // becomes a check on it: the two should agree within the rounding of the
+      // packed fields. A residual well above the measured cost means something
+      // outside the firmware's power model is draining the cell.
+      var gapMas = a.bleMas - a.bleConnMeasuredMas;
+      note = "O equipamento reportou o tempo de conexão diretamente, então ele não é mais estimado. " +
+        "O resíduo do consumo (" + fmtInt(a.bleMas) + " mA·s) serve agora de conferência: ";
+      if (a.bleConnSaturated) {
+        // A saturated byte is a lower bound, so comparing it against the
+        // residual says nothing — the real link time can be arbitrarily larger.
+        note += "não é possível conferir enquanto o campo estiver saturado — o tempo de link reportado é um piso, " +
+          "e o consumo real da conexão pode ser bem maior que o mostrado ao lado.";
+      } else if (Math.abs(gapMas) <= BLE_RESIDUAL_TOLERANCE_MAS + a.bleAdvMaxS * POWER.bleAdvMa) {
+        note += "ele bate com o custo do link medido mais o advertising, dentro do arredondamento dos campos.";
+      } else if (gapMas > 0) {
+        note += "ele excede o custo do link medido em <b>" + fmtInt(gapMas) + " mA·s</b>, mais do que o advertising " +
+          "e o arredondamento explicam — há consumo fora do modelo de potência do firmware.";
+      } else {
+        note += "ele fica <b>abaixo</b> do custo do link medido, o que sugere que as correntes do modelo " +
+          "(190 µA para o link) estão superestimadas para este equipamento.";
+      }
+    } else if (a.bleMas <= 0) {
+      note = "O consumo reportado não excede o custo de LoRa TX, LoRa RX e repouso — não há resíduo para atribuir ao BLE. " +
+        "Isso significa apenas que a atividade de Bluetooth ficou <b>abaixo do piso de ruído do método</b> (ver precisão adiante), não que ela tenha sido nula: " +
+        "uma sessão curta de configuração desaparece dentro do arredondamento dos campos de rádio.";
+    } else if (!a.bleFromReportedSleep) {
+      note = "Este pacote não traz <code>intervalSleep</code>, então o repouso foi inferido como toda a vida útil fora de TX/RX. " +
+        "Isso joga o tempo de CPU ativa que não cai em nenhum balde dentro do número de BLE — trate-o como <b>limite superior</b>, não como medida. " +
+        "Com o tempo de repouso reportado (pacotes P2P), a ferramenta separa conexão de advertising.";
+    } else if (a.bleSplit) {
+      note = "Com o repouso reportado, sobram duas equações — a energia do resíduo e a janela de tempo fora de repouso e rádio LoRa — " +
+        "o que permite separar conexão de advertising. A janela também absorve o tempo de CPU ativa que não é contabilizado em nenhum balde, " +
+        "então o advertising tende a ficar superestimado e a conexão, subestimada.";
+    } else {
+      note = "A janela de tempo fora de repouso e rádio LoRa (" + humanizeSeconds(a.bleWindowS) + ") não é compatível com a energia do resíduo " +
+        "— fica fora da faixa de " + humanizeSeconds(a.bleConnMaxS) + " a " + humanizeSeconds(a.bleAdvMaxS) + " que essa energia admite. " +
+        "Sem a segunda equação, só é possível limitar cada parcela separadamente.";
+    }
+    // Say plainly why the measured link time is missing, so a zero here is not
+    // read as "this device never had a BLE connection".
+    if (!a.helpIsPacked) {
+      note += " <b>O tempo de conexão não é medido neste pacote:</b> " +
+        (a.fwVersion
+          ? "o equipamento roda firmware " + versionText(a.fwVersion) + ", e o campo lora_help_tx_cnt só passa a carregar o tempo de link a partir da versão 2.2.0."
+          : "o pacote não informa a versão de firmware, então lora_help_tx_cnt é lido da forma antiga (uint16 inteiro = percentual de bateria).");
+    }
+
+    $("ble-note").innerHTML = note;
+
+    $("ble-note-precision").innerHTML =
+      "<b>Precisão:</b> o pacote envia as janelas de rádio em unidades de 100 ms e o consumo truncado para inteiro, " +
+      "então o resíduo carrega até ~" + fmtDec(BLE_RESIDUAL_TOLERANCE_MAS, 0) + " mA·s de erro — o equivalente a cerca de " +
+      humanizeSeconds(a.bleToleranceS) + " de conexão ou " + humanizeSeconds(BLE_RESIDUAL_TOLERANCE_MAS / POWER.bleAdvMa) + " de advertising. " +
+      "Sessões conectadas mais curtas que isso ficam abaixo do ruído, e o tempo de advertising é praticamente irrecuperável por este método.";
+
+    $("panel-ble").hidden = false;
   }
 
   function renderPackets(a) {
@@ -854,7 +1107,7 @@ details.inspector + details.inspector { margin-top: 14px; }
 
   function hideResultPanels() {
     ["section-id", "section-results", "panel-distribution", "panel-consumption-distribution", "panel-crosscheck",
-      "panel-packets", "panel-files", "panel-raw"].forEach(function (id) { $(id).hidden = true; });
+      "panel-ble", "panel-packets", "panel-files", "panel-raw"].forEach(function (id) { $(id).hidden = true; });
   }
 
   // The platform wraps the device's status pack inside an envelope
@@ -934,6 +1187,7 @@ details.inspector + details.inspector { margin-top: 14px; }
       renderStats(a, delta);
       renderConsumptionDistribution(a);
       renderCrossCheck(a);
+      renderBle(a);
       renderPackets(a);
       renderDistribution(a);
       renderRaw(a);
@@ -942,6 +1196,7 @@ details.inspector + details.inspector { margin-top: 14px; }
       $("panel-distribution").hidden = true;
       $("panel-consumption-distribution").hidden = true;
       $("panel-crosscheck").hidden = true;
+      $("panel-ble").hidden = true;
       $("panel-packets").hidden = true;
       $("panel-raw").hidden = true;
     }
